@@ -1,0 +1,776 @@
+from flask import Blueprint, request, jsonify, current_app
+from .models import db, User, Event, Session, Registration, CheckIn, OfflineDevice as Device
+from .services import FingerprintService, NotificationService
+from datetime import datetime, timezone
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
+import io
+import csv
+
+main_routes = Blueprint('main', __name__)
+
+# Global service instances:
+try:
+    fingerprint_service = FingerprintService()
+except ValueError as e:
+    print(f"WARNING: FingerprintService could not be initialized at import time: {e}")
+    fingerprint_service = None
+except Exception as e_fp_service:
+    print(f"WARNING: Unexpected error initializing FingerprintService at import time: {e_fp_service}")
+    fingerprint_service = None
+
+try:
+    notification_service = NotificationService()
+except Exception as e_notification_service:
+    print(f"WARNING: NotificationService could not be initialized at import time: {e_notification_service}")
+    notification_service = None
+
+@main_routes.route('/register', methods=['POST'])
+def register():
+    current_app.logger.info(f"Accessed /register endpoint with raw data: {request.data[:500]}")
+    data = request.get_json()
+    if not data:
+        current_app.logger.error("/register error: Request body must be JSON or is empty.")
+        return jsonify({'error': 'Request body must be JSON and not empty'}), 400
+
+    required_fields = ['name', 'phone']
+    missing_fields = [field for field in required_fields if field not in data or not data[field]]
+    if missing_fields:
+        current_app.logger.error(f"/register error: Missing required fields: {', '.join(missing_fields)}. Data received: {data}")
+        return jsonify({'error': f"Missing required fields: {', '.join(missing_fields)}"}), 400
+
+    try:
+        user_email = data.get('email')
+        if user_email == "":  # Convert empty string to None
+            user_email = None
+
+        if User.query.filter_by(phone=data['phone']).first():
+            current_app.logger.info(f"/register: Attempt to register existing phone: {data['phone']}")
+            return jsonify({'error': 'User with this phone number already exists'}), 409
+        if user_email and User.query.filter_by(email=user_email).first():
+            current_app.logger.info(f"/register: Attempt to register existing email: {user_email}")
+            return jsonify({'error': 'User with this email already exists'}), 409
+
+        new_user = User(
+            name=data['name'],
+            phone=data['phone'],
+            email=user_email,
+            firebase_uid=data.get('firebase_uid')
+        )
+
+        if 'fingerprint_data' in data and data['fingerprint_data']:
+            if fingerprint_service:
+                new_user.fingerprint_template_1 = data['fingerprint_data']
+            else:
+                current_app.logger.warning("/register: Fingerprint data provided but FingerprintService not available.")
+
+        db.session.add(new_user)
+        try:
+            db.session.commit()
+            current_app.logger.info(f"/register: New user created with ID: {new_user.id}, Fallback ID: {new_user.fallback_id}")
+        except IntegrityError as ie_user:
+            db.session.rollback()
+            current_app.logger.error(f"IntegrityError committing new user: {ie_user.orig}", exc_info=True)
+            error_msg = 'Failed to create user due to data conflict (e.g., fallback ID, phone, or email already exists).'
+            if hasattr(ie_user.orig, 'diag') and ie_user.orig.diag and hasattr(ie_user.orig.diag, 'constraint_name'):
+                if 'uq_user_phone' in ie_user.orig.diag.constraint_name:
+                    error_msg = 'User with this phone number already exists.'
+                elif 'users_email_key' in ie_user.orig.diag.constraint_name:
+                    error_msg = 'User with this email already exists.'
+                elif 'users_fallback_id_key' in ie_user.orig.diag.constraint_name:
+                    error_msg = 'A unique fallback ID could not be generated. Please try again.'
+            elif ie_user.orig and "UNIQUE constraint failed: users.phone" in str(ie_user.orig).lower():
+                error_msg = 'User with this phone number already exists.'
+            elif ie_user.orig and "UNIQUE constraint failed: users.email" in str(ie_user.orig).lower():
+                error_msg = 'User with this email already exists.'
+            elif ie_user.orig and "UNIQUE constraint failed: users.fallback_id" in str(ie_user.orig).lower():
+                error_msg = 'A unique fallback ID could not be generated. Please try again.'
+            return jsonify({'error': error_msg}), 409
+        except Exception as e_user_commit:
+            db.session.rollback()
+            current_app.logger.error(f"Exception committing new user: {e_user_commit}", exc_info=True)
+            return jsonify({'error': 'Failed to create user due to an unexpected error.'}), 500
+
+        registration_record = None
+        event_id_from_data = data.get('event_id')
+        if event_id_from_data:
+            try:
+                event_id_int = int(event_id_from_data)
+                event = Event.query.get(event_id_int)
+                if not event:
+                    current_app.logger.warning(f"/register: User {new_user.id} created, but event with id {event_id_int} not found.")
+                    return jsonify({
+                        'status': 'user_created_event_not_found',
+                        'message': f"User created successfully, but event with id {event_id_int} not found. User not registered for event.",
+                        'user_id': new_user.id, 'fallback_id': new_user.fallback_id
+                    }), 404
+
+                existing_registration = Registration.query.filter_by(user_id=new_user.id, event_id=event.id).first()
+                if existing_registration:
+                    registration_record = existing_registration
+                    current_app.logger.info(f"/register: User {new_user.id} already registered for event {event.id}")
+                else:
+                    registration_record = Registration(user_id=new_user.id, event_id=event.id)
+                    db.session.add(registration_record)
+                    try:
+                        db.session.commit()
+                        current_app.logger.info(f"/register: User {new_user.id} successfully registered for event {event.id}")
+                    except IntegrityError as ie_reg:
+                        db.session.rollback()
+                        current_app.logger.error(f"IntegrityError committing registration for user {new_user.id} event {event.id}: {ie_reg.orig}", exc_info=True)
+                        return jsonify({'error': 'Failed to register user for the event due to a data conflict (e.g. already registered).'}), 409
+                    except Exception as e_reg_commit:
+                        db.session.rollback()
+                        current_app.logger.error(f"Exception committing registration for user {new_user.id} event {event.id}: {e_reg_commit}", exc_info=True)
+                        return jsonify({'error': 'Failed to register user for the event due to an unexpected error.'}), 500
+            except ValueError:
+                current_app.logger.error(f"/register: Invalid event_id format: {event_id_from_data}")
+                return jsonify({'error': f"Invalid event_id format: {event_id_from_data}. Must be an integer."}), 400
+
+        response_data = {
+            'status': 'success', 'user_id': new_user.id, 'fallback_id': new_user.fallback_id
+        }
+        if registration_record:
+            response_data['registration_id'] = registration_record.id
+
+        return jsonify(response_data), 201
+
+    except ValueError as ve_main:
+        current_app.logger.error(f"ValueError in registration (likely JSON parsing or data conversion): {ve_main}", exc_info=True)
+        return jsonify({'error': f"Invalid data in request: {ve_main}"}), 400
+    except Exception as e_main:
+        db.session.rollback()
+        current_app.logger.error(f"General exception during registration setup: {e_main}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred during registration process.'}), 500
+
+@main_routes.route('/checkin', methods=['POST'])
+def checkin():
+    current_app.logger.info(f"Accessed /checkin endpoint with raw data: {request.data[:500]}")
+    data = request.get_json()
+    if not data:
+        current_app.logger.error("/checkin error: Request body must be JSON")
+        return jsonify({'error': 'Request body must be JSON'}), 400
+
+    required_fields = ['identifier_type', 'identifier_value', 'session_id', 'event_id']
+    missing_fields = [field for field in required_fields if field not in data]
+    if missing_fields:
+        current_app.logger.error(f"/checkin error: Missing required fields: {', '.join(missing_fields)}. Data: {data}")
+        return jsonify({'error': f"Missing required fields: {', '.join(missing_fields)}"}), 400
+
+    try:
+        user = None
+        identifier_type = data['identifier_type']
+        identifier_value = data['identifier_value']
+
+        if identifier_type == 'fingerprint_user_id':
+            user = User.query.get(int(identifier_value))
+        elif identifier_type == 'fallback_id':
+            user = User.query.filter_by(fallback_id=str(identifier_value)).first()
+        elif identifier_type == 'phone':
+            user = User.query.filter_by(phone=identifier_value).first()
+        else:
+            current_app.logger.error(f"/checkin error: Invalid identifier_type: {identifier_type}")
+            return jsonify({'error': 'Invalid identifier_type provided.'}), 400
+
+        if not user:
+            current_app.logger.info(f"/checkin: User not found for identifier_type '{identifier_type}' and value '{identifier_value}'")
+            return jsonify({'error': 'User not found for the given identifier.'}), 404
+
+        event = Event.query.get(int(data['event_id']))
+        if not event:
+            current_app.logger.info(f"/checkin: Event with id {data['event_id']} not found.")
+            return jsonify({'error': f"Event with id {data['event_id']} not found."}), 404
+
+        session_obj = Session.query.get(int(data['session_id']))
+        if not session_obj or session_obj.event_id != event.id:
+            current_app.logger.info(f"/checkin: Session with id {data['session_id']} not found or not part of event {event.id}.")
+            return jsonify({'error': f"Session with id {data['session_id']} not found for this event."}), 404
+
+        registration = Registration.query.filter_by(user_id=user.id, event_id=event.id).first()
+        if not registration:
+            current_app.logger.info(f"/checkin: User {user.id} not registered for event {event.id}.")
+            return jsonify({'error': 'User not registered for this event.'}), 403
+
+        existing_checkin = CheckIn.query.filter_by(user_id=user.id, session_id=session_obj.id).first()
+        if existing_checkin:
+            current_app.logger.info(f"/checkin: User {user.id} already checked into session {session_obj.id}.")
+            return jsonify({
+                'status': 'warning',
+                'message': 'User already checked into this session.',
+                'checkin_id': existing_checkin.id,
+                'user': {'id': user.id, 'name': user.name, 'phone': user.phone, 'fallback_id': user.fallback_id},
+                'session_name': session_obj.name,
+                'event_name': event.name
+            }), 200
+
+        created_at_local_str = data.get('created_at_local')
+        check_in_time_from_payload = datetime.fromisoformat(created_at_local_str.replace("Z", "+00:00")) if created_at_local_str else datetime.now(timezone.utc)
+
+        new_checkin = CheckIn(
+            user_id=user.id,
+            session_id=session_obj.id,
+            event_id=event.id,
+            device_id=data.get('device_id'),
+            is_synced=True,
+            created_at_local=check_in_time_from_payload,
+            check_in_time=check_in_time_from_payload,
+            method=data.get('method', identifier_type)
+        )
+        db.session.add(new_checkin)
+        db.session.commit()
+
+        current_app.logger.info(f"/checkin: Successfully checked in user {user.id} for session {session_obj.id}.")
+        if notification_service:
+            notification_service.send_checkin_notifications(user, session_obj)
+
+        return jsonify({
+            'status': 'success',
+            'checkin_id': new_checkin.id,
+            'user': {'id': user.id, 'name': user.name, 'phone': user.phone, 'fallback_id': user.fallback_id},
+            'session_name': session_obj.name,
+            'event_name': event.name
+        }), 201
+
+    except ValueError as ve:
+        db.session.rollback()
+        current_app.logger.error(f"ValueError during check-in: {ve}", exc_info=True)
+        return jsonify({'error': f'Invalid data format in request: {ve}'}), 400
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Exception during check-in: {e}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred during check-in.'}), 500
+
+@main_routes.route('/sync', methods=['POST'])
+def sync():
+    current_app.logger.info(f"Accessed /sync endpoint with raw data: {request.data[:500]}")
+    data = request.get_json()
+    if not data:
+        current_app.logger.error("/sync error: Request body must be JSON")
+        return jsonify({'error': 'Request body must be JSON'}), 400
+
+    device_uuid = data.get('device_id')
+    check_ins_data = data.get('check_ins', [])
+    new_registrations_data = data.get('new_registrations', [])
+
+    if not device_uuid:
+        current_app.logger.error(f"/sync error: Missing device_id. Data: {data}")
+        return jsonify({'error': 'Missing device_id'}), 400
+
+    try:
+        device = Device.query.filter_by(device_uuid=str(device_uuid)).first()
+        if not device:
+            device = Device(device_uuid=str(device_uuid), last_seen=datetime.now(timezone.utc))
+            db.session.add(device)
+        else:
+            device.last_seen = datetime.now(timezone.utc)
+
+        synced_checkin_responses = []
+        new_user_responses = []
+
+        for reg_data in new_registrations_data:
+            try:
+                user_phone = reg_data.get('phone')
+                user_email_from_sync = reg_data.get('email')
+                if user_email_from_sync == "":
+                    user_email_from_sync = None
+                user_name = reg_data.get('name')
+                local_user_id_from_payload = reg_data.get('local_id')
+
+                if not user_name or not user_phone:
+                    current_app.logger.warning(f"Sync: Missing name or phone for new registration: {reg_data}")
+                    new_user_responses.append({'local_id': local_user_id_from_payload, 'server_id': None, 'fallback_id': None, 'status': 'error', 'message': 'Missing name or phone'})
+                    continue
+
+                user = User.query.filter_by(phone=user_phone).first()
+                if not user and user_email_from_sync:
+                    user = User.query.filter_by(email=user_email_from_sync).first()
+
+                server_user_id = None
+                user_fallback_id = None
+                created_new = False
+
+                if user:
+                    server_user_id = user.id
+                    user_fallback_id = user.fallback_id
+                    if fingerprint_service and 'fingerprint_data' in reg_data and reg_data['fingerprint_data'] and not user.fingerprint_template_1:
+                        user.fingerprint_template_1 = reg_data['fingerprint_data']
+                    current_app.logger.info(f"Sync: Existing user found for new registration data: User ID {server_user_id}")
+                else:
+                    new_user_for_sync = User(name=user_name, phone=user_phone, email=user_email_from_sync)
+                    if fingerprint_service and 'fingerprint_data' in reg_data and reg_data['fingerprint_data']:
+                        new_user_for_sync.fingerprint_template_1 = reg_data['fingerprint_data']
+                    db.session.add(new_user_for_sync)
+                    db.session.flush()
+                    server_user_id = new_user_for_sync.id
+                    user_fallback_id = new_user_for_sync.fallback_id
+                    created_new = True
+                    current_app.logger.info(f"Sync: New user created: User ID {server_user_id}")
+
+                event_id_for_reg = reg_data.get('event_id')
+                if event_id_for_reg and server_user_id:
+                    event_for_reg = Event.query.get(int(event_id_for_reg))
+                    if event_for_reg:
+                        if not Registration.query.filter_by(user_id=server_user_id, event_id=event_for_reg.id).first():
+                            registration = Registration(user_id=server_user_id, event_id=event_for_reg.id)
+                            db.session.add(registration)
+                            current_app.logger.info(f"Sync: Registered user {server_user_id} for event {event_for_reg.id}")
+                    else:
+                        current_app.logger.warning(f"Sync: Event ID {event_id_for_reg} not found for registration of user {server_user_id}.")
+                
+                new_user_responses.append({
+                    'local_id': local_user_id_from_payload,
+                    'server_id': server_user_id,
+                    'fallback_id': user_fallback_id,
+                    'status': 'created' if created_new else 'existing'
+                })
+
+            except IntegrityError as ie_reg_sync_item:
+                db.session.rollback()
+                current_app.logger.error(f"Sync: Integrity error for processing a new registration {reg_data.get('name')}: {ie_reg_sync_item.orig}", exc_info=True)
+                err_msg = f"Data conflict for {reg_data.get('name')}"
+                if 'users_phone_key' in str(ie_reg_sync_item.orig) or 'UNIQUE constraint failed: users.phone' in str(ie_reg_sync_item.orig): err_msg = f"Phone {reg_data.get('phone')} already exists."
+                elif 'users_email_key' in str(ie_reg_sync_item.orig) or 'UNIQUE constraint failed: users.email' in str(ie_reg_sync_item.orig): err_msg = f"Email {reg_data.get('email')} already exists."
+                new_user_responses.append({'local_id': reg_data.get('local_id'), 'server_id': None, 'fallback_id': None, 'status': 'error', 'message': err_msg})
+            except Exception as e_user_sync_item:
+                db.session.rollback()
+                current_app.logger.error(f"Sync: General error processing new registration {reg_data.get('name')}: {e_user_sync_item}", exc_info=True)
+                new_user_responses.append({'local_id': reg_data.get('local_id'), 'server_id': None, 'fallback_id': None, 'status': 'error', 'message': str(e_user_sync_item)})
+
+        try:
+            db.session.commit()
+            current_app.logger.info(f"Sync: Successfully committed batch of new users/registrations.")
+        except Exception as e_commit_users_batch:
+            db.session.rollback()
+            current_app.logger.error(f"Sync: Error committing batch of new users/registrations: {e_commit_users_batch}", exc_info=True)
+            for resp in new_user_responses:
+                if resp.get('status') in ['created', 'existing'] and not User.query.get(resp.get('server_id')):
+                        resp['status'] = 'error'
+                        resp['message'] = 'Batch commit failed for users'
+                        resp['server_id'] = None
+                        resp['fallback_id'] = None
+
+        for checkin_data in check_ins_data:
+            try:
+                server_user_id_from_payload = checkin_data.get('user_id')
+                local_checkin_id = checkin_data.get('local_id')
+                actual_server_user_id = None
+
+                if isinstance(server_user_id_from_payload, str) and server_user_id_from_payload.startswith("local_"):
+                    mapped_user = next((u for u in new_user_responses if u['local_id'] == server_user_id_from_payload and u['server_id'] is not None), None)
+                    if mapped_user:
+                        actual_server_user_id = mapped_user['server_id']
+                    else:
+                        current_app.logger.warning(f"Sync: Could not map local user ID '{server_user_id_from_payload}' for check-in.")
+                        synced_checkin_responses.append({'local_checkin_id': local_checkin_id, 'server_checkin_id': None, 'status': 'error', 'message': 'User mapping failed, server_id not found for local_id'})
+                        continue
+                elif isinstance(server_user_id_from_payload, int):
+                    actual_server_user_id = server_user_id_from_payload
+                else:
+                    current_app.logger.warning(f"Sync: Invalid user_id format '{server_user_id_from_payload}' for check-in.")
+                    synced_checkin_responses.append({'local_checkin_id': local_checkin_id, 'server_checkin_id': None, 'status': 'error', 'message': f'Invalid user_id format: {server_user_id_from_payload}'})
+                    continue
+                
+                if actual_server_user_id is None:
+                    current_app.logger.error(f"Sync: actual_server_user_id is None for payload user_id {server_user_id_from_payload}, check-in {local_checkin_id}")
+                    synced_checkin_responses.append({'local_checkin_id': local_checkin_id, 'server_checkin_id': None, 'status': 'error', 'message': 'Resolved user ID is null'})
+                    continue
+
+                user_for_checkin = User.query.get(actual_server_user_id)
+                event_for_checkin = Event.query.get(checkin_data.get('event_id'))
+                session_for_checkin = Session.query.get(checkin_data.get('session_id'))
+
+                if not all([user_for_checkin, event_for_checkin, session_for_checkin]):
+                    missing_parts = []
+                    if not user_for_checkin: missing_parts.append(f"user ID {actual_server_user_id}")
+                    if not event_for_checkin: missing_parts.append(f"event ID {checkin_data.get('event_id')}")
+                    if not session_for_checkin: missing_parts.append(f"session ID {checkin_data.get('session_id')}")
+                    current_app.logger.warning(f"Sync: Invalid entities for check-in data {checkin_data}. Missing: {', '.join(missing_parts)}")
+                    synced_checkin_responses.append({'local_checkin_id': local_checkin_id, 'server_checkin_id': None, 'status': 'error', 'message': f'Invalid related entity/entities: {", ".join(missing_parts)}'})
+                    continue
+
+                if not Registration.query.filter_by(user_id=user_for_checkin.id, event_id=event_for_checkin.id).first():
+                    current_app.logger.info(f"Sync: User {user_for_checkin.id} not registered for event {event_for_checkin.id}. Auto-registering.")
+                    db.session.add(Registration(user_id=user_for_checkin.id, event_id=event_for_checkin.id))
+
+                created_at_local_str = checkin_data.get('created_at_local')
+                try:
+                    check_in_time_from_device = datetime.fromisoformat(created_at_local_str.replace("Z", "+00:00")) if created_at_local_str else datetime.now(timezone.utc)
+                except ValueError:
+                    current_app.logger.warning(f"Sync: Invalid created_at_local format '{created_at_local_str}'. Using current UTC time.")
+                    check_in_time_from_device = datetime.now(timezone.utc)
+
+                existing_checkin = CheckIn.query.filter_by(user_id=user_for_checkin.id, session_id=session_for_checkin.id).first()
+                if existing_checkin:
+                    current_app.logger.info(f"Sync: Duplicate check-in skipped for user {user_for_checkin.id} session {session_for_checkin.id}")
+                    synced_checkin_responses.append({'local_checkin_id': local_checkin_id, 'server_checkin_id': existing_checkin.id, 'status': 'duplicate'})
+                    continue
+
+                new_checkin_sync = CheckIn(
+                    user_id=user_for_checkin.id, session_id=session_for_checkin.id, event_id=event_for_checkin.id,
+                    device_id=str(device_uuid), is_synced=True,
+                    created_at_local=check_in_time_from_device,
+                    check_in_time=check_in_time_from_device,
+                    method=checkin_data.get('method', 'offline_sync')
+                )
+                db.session.add(new_checkin_sync)
+                db.session.flush()
+                synced_checkin_responses.append({'local_checkin_id': local_checkin_id, 'server_checkin_id': new_checkin_sync.id, 'status': 'synced'})
+                current_app.logger.info(f"Sync: Processed check-in for user {user_for_checkin.id} for session {session_for_checkin.id}, local_id {local_checkin_id}")
+
+            except Exception as e_checkin_sync_item:
+                current_app.logger.error(f"Sync: Error processing an individual check-in data {checkin_data.get('local_id')}: {e_checkin_sync_item}", exc_info=True)
+                synced_checkin_responses.append({'local_checkin_id': checkin_data.get('local_id'), 'server_checkin_id': None, 'status': 'error', 'message': str(e_checkin_sync_item)})
+
+        device.last_sync_time = datetime.now(timezone.utc)
+        db.session.commit()
+        current_app.logger.info("Sync: Successfully committed batch of check-ins and device update.")
+
+        return jsonify({
+            'status': 'success',
+            'new_users_feedback': new_user_responses,
+            'synced_checkins_feedback': synced_checkin_responses
+        }), 200
+
+    except Exception as e_sync_main:
+        db.session.rollback()
+        current_app.logger.error(f"Critical error in /sync: {e_sync_main}", exc_info=True)
+        failed_user_feedback = []
+        for reg_data in new_registrations_data:
+            failed_user_feedback.append({
+                'local_id': reg_data.get('local_id'), 'server_id': None, 'fallback_id': None, 'status': 'error', 'message': 'Sync process failed due to a server error.'
+            })
+        failed_checkin_feedback = []
+        for checkin_data in check_ins_data:
+            failed_checkin_feedback.append({
+                'local_checkin_id': checkin_data.get('local_id'), 'server_checkin_id': None, 'status': 'error', 'message': 'Sync process failed due to a server error.'
+            })
+
+        return jsonify({
+            'status': 'error',
+            'message': 'An unexpected error occurred during the sync process.',
+            'details': str(e_sync_main),
+            'new_users_feedback': failed_user_feedback,
+            'synced_checkins_feedback': failed_checkin_feedback
+            }), 500
+
+@main_routes.route('/dashboard', methods=['GET'])
+def dashboard():
+    current_app.logger.info(f"Accessed /dashboard endpoint with args: {request.args}")
+    event_id_str = request.args.get('event_id')
+    session_id_str = request.args.get('session_id')
+
+    event_id = int(event_id_str) if event_id_str and event_id_str.isdigit() and event_id_str != 'all' else None
+    session_id = int(session_id_str) if session_id_str and session_id_str.isdigit() and session_id_str != 'all' else None
+
+    try:
+        attendees_query = db.session.query(
+            CheckIn.check_in_time, CheckIn.method,
+            User.name.label('user_name'), User.phone.label('user_phone'),
+            User.email.label('user_email'), User.fallback_id.label('user_fallback_id'),
+            Session.name.label('session_name'), Event.name.label('event_name')
+        ).select_from(CheckIn).join(User, User.id == CheckIn.user_id)\
+                                .join(Session, Session.id == CheckIn.session_id)\
+                                .join(Event, Event.id == CheckIn.event_id)
+
+        total_registered_users_q = db.session.query(func.count(User.id))
+        total_checkins_q = db.session.query(func.count(CheckIn.id))
+        unique_attendees_q = db.session.query(func.count(db.distinct(CheckIn.user_id)))
+
+        if event_id:
+            attendees_query = attendees_query.filter(CheckIn.event_id == event_id)
+            total_registered_users_q = db.session.query(func.count(db.distinct(Registration.user_id))).filter(Registration.event_id == event_id)
+            total_checkins_q = total_checkins_q.filter(CheckIn.event_id == event_id)
+            unique_attendees_q = unique_attendees_q.filter(CheckIn.event_id == event_id)
+
+        if session_id:
+            attendees_query = attendees_query.filter(CheckIn.session_id == session_id)
+            total_checkins_q = total_checkins_q.filter(CheckIn.session_id == session_id)
+            unique_attendees_q = unique_attendees_q.filter(CheckIn.session_id == session_id)
+
+        attendees_results = attendees_query.order_by(CheckIn.check_in_time.desc()).limit(100).all()
+
+        attendees_list = [{
+            'user_name': r.user_name, 'user_phone': r.user_phone, 'user_email': r.user_email,
+            'user_fallback_id': r.user_fallback_id,
+            'checkin_time': r.check_in_time.isoformat() if r.check_in_time else None,
+            'session_name': r.session_name, 'event_name': r.event_name, 'method': r.method
+        } for r in attendees_results]
+
+        total_registered_users_count = total_registered_users_q.scalar() or 0
+        total_checkins_count = total_checkins_q.scalar() or 0
+        unique_attendees_count = unique_attendees_q.scalar() or 0
+
+        return jsonify({
+            'stats': {
+                'total_registered_users': total_registered_users_count,
+                'total_checkins': total_checkins_count,
+                'unique_attendees': unique_attendees_count,
+            },
+            'recent_attendees': attendees_list
+        }), 200
+
+    except ValueError as ve_dashboard:
+        current_app.logger.error(f"ValueError in /dashboard (likely bad filter param): {ve_dashboard}", exc_info=True)
+        return jsonify({'error': f'Invalid filter parameter format: {ve_dashboard}'}), 400
+    except Exception as e_dashboard:
+        current_app.logger.error(f"Exception in /dashboard: {e_dashboard}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred fetching dashboard data.'}), 500
+
+@main_routes.route('/report', methods=['GET'])
+def report():
+    current_app.logger.info(f"Accessed /report endpoint with args: {request.args}")
+    event_id_str = request.args.get('event_id')
+    session_id_str = request.args.get('session_id')
+    report_format = request.args.get('format', 'json').lower()
+
+    event_id = int(event_id_str) if event_id_str and event_id_str.isdigit() and event_id_str != 'all' else None
+    session_id = int(session_id_str) if session_id_str and session_id_str.isdigit() and session_id_str != 'all' else None
+
+    try:
+        query = db.session.query(
+            User.id.label('user_id'), User.name.label('user_name'),
+            User.phone.label('user_phone'), User.email.label('user_email'),
+            User.fallback_id.label('user_fallback_id'),
+            CheckIn.check_in_time, CheckIn.method.label('checkin_method'),
+            CheckIn.device_id.label('checkin_device_id'),
+            Session.name.label('session_name'), Event.name.label('event_name')
+        ).select_from(CheckIn).join(User, User.id == CheckIn.user_id)\
+                                .join(Session, Session.id == CheckIn.session_id)\
+                                .join(Event, Event.id == CheckIn.event_id)
+
+        if event_id:
+            query = query.filter(CheckIn.event_id == event_id)
+        if session_id:
+            query = query.filter(CheckIn.session_id == session_id)
+
+        results = query.order_by(Event.name, Session.name, CheckIn.check_in_time, User.name).all()
+
+        report_data = [{
+            'user_id': r.user_id, 'name': r.user_name, 'phone': r.user_phone,
+            'email': r.user_email, 'fallback_id': r.user_fallback_id,
+            'checkin_time': r.check_in_time.isoformat() if r.check_in_time else None,
+            'session_name': r.session_name, 'event_name': r.event_name,
+            'method': r.checkin_method, 'device_id': r.checkin_device_id
+        } for r in results]
+
+        if report_format == 'csv':
+            if not report_data:
+                return "No data for CSV export.", 200, {'Content-Type': 'text/plain'}
+
+            output = io.StringIO()
+            fieldnames = ['user_id', 'name', 'phone', 'email', 'fallback_id', 'checkin_time', 'session_name', 'event_name', 'method', 'device_id']
+            if report_data:
+                fieldnames = report_data[0].keys()
+
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(report_data)
+
+            csv_output = output.getvalue()
+            output.close()
+            return csv_output, 200, {
+                'Content-Type': 'text/csv',
+                'Content-Disposition': f'attachment; filename="event_report_{event_id or "all"}_{session_id or "all"}.csv"'
+            }
+        else:
+            return jsonify(report_data), 200
+
+    except ValueError as ve_report:
+        current_app.logger.error(f"ValueError in /report (likely bad filter param): {ve_report}", exc_info=True)
+        return jsonify({'error': f'Invalid filter parameter format: {ve_report}'}), 400
+    except Exception as e_report:
+        current_app.logger.error(f"Exception in /report: {e_report}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred generating report.'}), 500
+
+@main_routes.route('/events', methods=['POST'])
+def create_event():
+    current_app.logger.info(f"Accessed POST /events with raw data: {request.data[:500]}")
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
+
+    required_fields = ['name', 'start_date', 'end_date']
+    missing_fields = [field for field in required_fields if field not in data or not data[field]]
+    if missing_fields:
+        return jsonify({'error': f"Missing required fields for event: {', '.join(missing_fields)}"}), 400
+
+    try:
+        start_date_iso = data.get('start_date')
+        end_date_iso = data.get('end_date')
+
+        if not start_date_iso or not end_date_iso:
+            return jsonify({'error': 'start_date and end_date are required and cannot be empty.'}), 400
+
+        start_date = datetime.fromisoformat(start_date_iso.replace("Z", "+00:00"))
+        end_date = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+
+        if end_date <= start_date:
+            return jsonify({'error': 'End date must be after start date.'}), 400
+
+        new_event = Event(
+            name=data['name'],
+            start_date=start_date,
+            end_date=end_date
+        )
+        db.session.add(new_event)
+        db.session.commit()
+        current_app.logger.info(f"Event created successfully: ID {new_event.id}, Name: {new_event.name}")
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Event created successfully.',
+            'event': {
+                'id': new_event.id,
+                'name': new_event.name,
+                'start_date': new_event.start_date.isoformat(),
+                'end_date': new_event.end_date.isoformat()
+            }
+        }), 201
+
+    except ValueError as ve_create_event:
+        db.session.rollback()
+        current_app.logger.error(f"ValueError creating event: {ve_create_event}", exc_info=True)
+        return jsonify({'error': f'Invalid date format for start_date or end_date. Please use ISO format (YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+00:00). Details: {ve_create_event}'}), 400
+    except IntegrityError as ie_create_event:
+        db.session.rollback()
+        current_app.logger.error(f"IntegrityError creating event: {ie_create_event.orig}", exc_info=True)
+        error_detail = 'Event with this name or details might already exist or violates a constraint.'
+        if hasattr(ie_create_event.orig, 'diag') and 'events_name_key' in str(ie_create_event.orig.diag.constraint_name):
+            error_detail = f"An event with the name '{data['name']}' already exists."
+        elif ie_create_event.orig and "UNIQUE constraint failed: events.name" in str(ie_create_event.orig).lower():
+            error_detail = f"An event with the name '{data['name']}' already exists."
+        return jsonify({'error': error_detail}), 409
+    except Exception as e_create_event:
+        db.session.rollback()
+        current_app.logger.error(f"Exception creating event: {e_create_event}", exc_info=True)
+        return jsonify({'error': 'An unexpected error occurred while creating the event.'}), 500
+
+@main_routes.route('/events', methods=['GET'])
+def get_events_list_route():
+    current_app.logger.info("Accessed GET /events endpoint")
+    try:
+        events_query = Event.query.order_by(Event.start_date.desc()).all()
+        events_data = []
+        for event_item in events_query:
+            events_data.append({
+                'id': event_item.id,
+                'name': event_item.name,
+                'start_date': event_item.start_date.isoformat(),
+                'end_date': event_item.end_date.isoformat()
+            })
+        return jsonify(events_data), 200
+    except Exception as e:
+        current_app.logger.error(f"Error fetching events list: {e}", exc_info=True)
+        return jsonify({'error': 'Failed to fetch events list', 'details': str(e)}), 500
+
+@main_routes.route('/events/<int:event_id>/sessions', methods=['GET'])
+def get_event_sessions(event_id):
+    current_app.logger.info(f"Accessed /events/{event_id}/sessions endpoint")
+    try:
+        event = Event.query.get_or_404(event_id) 
+        sessions = Session.query.filter_by(event_id=event.id).order_by(Session.start_time).all()
+        return jsonify([{
+            'id': session.id, 'name': session.name,
+            'start_time': session.start_time.isoformat(),
+            'end_time': session.end_time.isoformat()
+        } for session in sessions]), 200
+    except Exception as e: 
+        current_app.logger.error(f"Exception in /events/{event_id}/sessions: {e}", exc_info=True)
+        if hasattr(e, 'code') and e.code == 404: 
+            return jsonify({'error': str(e)}), 404
+        return jsonify({'error': 'An unexpected error occurred.'}), 500
+
+@main_routes.route('/events/<int:event_id>/sessions', methods=['POST'])
+def create_session_for_event(event_id):
+    current_app.logger.info(f"Accessed POST /events/{event_id}/sessions with raw data: {request.data[:500]}")
+    event = Event.query.get_or_404(event_id, description=f"Event with ID {event_id} not found to create session under.")
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Request body must be JSON'}), 400
+
+    required_fields = ['name', 'start_time', 'end_time']
+    missing_fields = [field for field in required_fields if field not in data or not data[field]]
+    if missing_fields:
+        return jsonify({'error': f"Missing required fields for session: {', '.join(missing_fields)}"}), 400
+
+    try:
+        start_time_iso = data.get('start_time')
+        end_time_iso = data.get('end_time')
+
+        if not start_time_iso or not end_time_iso:
+            return jsonify({'error': 'start_time and end_time are required for session and cannot be empty.'}), 400
+
+        session_start_time = datetime.fromisoformat(start_time_iso.replace("Z", "+00:00"))
+        session_end_time = datetime.fromisoformat(end_time_iso.replace("Z", "+00:00"))
+
+        if session_end_time <= session_start_time:
+            return jsonify({'error': 'Session end time must be after start time.'}), 400
+
+        event_start_date_aware = event.start_date if event.start_date.tzinfo else event.start_date.replace(tzinfo=timezone.utc)
+        event_end_date_aware = event.end_date if event.end_date.tzinfo else event.end_date.replace(tzinfo=timezone.utc)
+
+        if not (event_start_date_aware <= session_start_time < event_end_date_aware and \
+                event_start_date_aware < session_end_time <= event_end_date_aware):
+            return jsonify({'error': 'Session times must be strictly within the event start and end dates.'}), 400
+
+        new_session = Session(
+            name=data['name'],
+            start_time=session_start_time,
+            end_time=session_end_time,
+            event_id=event.id
+        )
+        db.session.add(new_session)
+        db.session.commit()
+        current_app.logger.info(f"Session created successfully for Event ID {event.id}: Session ID {new_session.id}, Name: {new_session.name}")
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Session created successfully.',
+            'session': {
+                'id': new_session.id,
+                'name': new_session.name,
+                'event_id': new_session.event_id,
+                'start_time': new_session.start_time.isoformat(),
+                'end_time': new_session.end_time.isoformat()
+            }
+        }), 201
+
+    except ValueError as ve:
+        db.session.rollback()
+        current_app.logger.error(f"ValueError creating session for event {event_id}: {ve}", exc_info=True)
+        return jsonify({'error': f'Invalid date format for session start_time or end_time. Please use ISO format (YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DDTHH:MM:SS+00:00). Details: {ve}'}), 400
+    except IntegrityError as ie:
+        db.session.rollback()
+        current_app.logger.error(f"IntegrityError creating session for event {event_id}: {ie.orig}", exc_info=True)
+        error_detail = 'Session with this name or details might already exist for this event or violates a constraint.'
+        if hasattr(ie.orig, 'diag') and 'sessions_event_id_name_key' in str(ie.orig.diag.constraint_name):
+            error_detail = f"A session with the name '{data['name']}' already exists for this event."
+        elif ie.orig and "UNIQUE constraint failed: sessions.name" in str(ie.orig).lower() and "sessions.event_id" in str(ie.orig).lower():
+            error_detail = f"A session with the name '{data['name']}' already exists for this event."
+        return jsonify({'error': error_detail}), 409
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Exception creating session for event {event_id}: {e}", exc_info=True)
+        if hasattr(e, 'code') and e.code == 404:
+            return jsonify({'error': str(e.description)}), 404
+        return jsonify({'error': 'An unexpected error occurred while creating the session.'}), 500
+
+@main_routes.route('/users', methods=['GET'])
+def get_users_list():
+    current_app.logger.info("Accessed /users endpoint")
+    try:
+        users_query = User.query.order_by(User.created_at.desc()).all()
+        users_data = []
+        for user_item in users_query: 
+            users_data.append({
+                'id': user_item.id,
+                'name': user_item.name,
+                'phone': user_item.phone,
+                'email': user_item.email,
+                'fallback_id': user_item.fallback_id,
+                'created_at': user_item.created_at.isoformat() if user_item.created_at else None
+            })
+        return jsonify(users_data), 200
+    except Exception as e:
+        current_app.logger.error(f"Error fetching users list: {e}", exc_info=True)
+        return jsonify({'error': 'Failed to fetch users list', 'details': str(e)}), 500
