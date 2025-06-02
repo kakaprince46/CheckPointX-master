@@ -91,8 +91,9 @@ class ProductionConfig(Config):
     if not os.getenv('SECRET_KEY') or Config.SECRET_KEY == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
         print("CRITICAL_WARNING [ProductionConfig]: Production SECRET_KEY is not set or is using the default development key!")
     if not os.getenv('ENCRYPTION_KEY'):
-        print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set!")    # Add checks for other critical API keys if they are essential for app startup
-# --- End of Updated ProductionConfig ---
+        print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set!")   
+         # Add checks for other critical API keys if they are essential for app startup
+         # --- End of Updated ProductionConfig ---
 
 config_by_name = dict(
     dev=DevelopmentConfig,
