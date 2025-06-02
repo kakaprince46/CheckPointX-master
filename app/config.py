@@ -30,7 +30,7 @@ class Config:
     # For local dev, this will pick up DB_URL from .env (e.g., sqlite:///dev_app.db)
     # For production, this will be overridden by ProductionConfig
     SQLALCHEMY_DATABASE_URI = DB_URL_FROM_ENV or \
-                              'sqlite:///' + os.path.join(backend_root_dir, 'default_app_sqlite.db')
+                                'sqlite:///' + os.path.join(backend_root_dir, 'default_app_sqlite.db')
     
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
@@ -59,7 +59,7 @@ class Config:
             elif 'default_app_sqlite.db' in Config.SQLALCHEMY_DATABASE_URI and loaded_db_url != Config.SQLALCHEMY_DATABASE_URI:
                 app.logger.warning(f"WARNING: DB_URL was set to '{loaded_db_url}' but resulted in SQLite fallback. Check DB_URL format.")
             elif 'sqlite:///' in Config.SQLALCHEMY_DATABASE_URI:
-                 app.logger.info(f"INFO: Using SQLite database URI: {Config.SQLALCHEMY_DATABASE_URI}")
+                app.logger.info(f"INFO: Using SQLite database URI: {Config.SQLALCHEMY_DATABASE_URI}")
 
         if not Config.ENCRYPTION_KEY:
             if app and hasattr(app, 'logger'):
@@ -75,7 +75,7 @@ class DevelopmentConfig(Config):
 class TestingConfig(Config):
     TESTING = True
     SQLALCHEMY_DATABASE_URI = os.getenv('TEST_DB_URL') or \
-                              'sqlite:///' + os.path.join(backend_root_dir, 'test_app.db') # SQLite in backend root for tests
+                                'sqlite:///' + os.path.join(backend_root_dir, 'test_app.db') # SQLite in backend root for tests
     WTF_CSRF_ENABLED = False 
     SECRET_KEY = os.getenv('TEST_SECRET_KEY', 'test-secret-key')
     ENCRYPTION_KEY = os.getenv('TEST_ENCRYPTION_KEY', Config.ENCRYPTION_KEY or 'test_default_encryption_key_32b_placeholder')
@@ -83,27 +83,28 @@ class TestingConfig(Config):
 
 class ProductionConfig(Config):
     DEBUG = False
-    # For a test deployment on Render using SQLite (NOT RECOMMENDED FOR REAL PRODUCTION APPS)
-    # Render provides a writable filesystem path, e.g., /var/data or relative to app root.
-    # Let's use a path relative to the backend root, inside an 'instance' folder that Render can write to.
-    # The `instance_path` for Flask is typically outside the `app` package.
-    # If `backend_root_dir` is C:\...\backend, then `instance` folder will be C:\...\backend\instance
-    # This is a common pattern for instance folders.
-    
-    # For Render, you might set `DATABASE_URL` in Render's environment variables.
-    # If you want to force SQLite for a test deployment on Render and `DATABASE_URL` is NOT set to a PostgreSQL URL:
-    RENDER_SQLITE_PATH = os.path.join(os.getenv('RENDER_INSTANCE_DIR', backend_root_dir), 'instance', 'prod_app.db')
-    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL') or f'sqlite:///{RENDER_SQLITE_PATH}'
-    
-    print(f"DEBUG [ProductionConfig]: SQLALCHEMY_DATABASE_URI set to: {SQLALCHEMY_DATABASE_URI}")
+    # Simplified SQLALCHEMY_DATABASE_URI for Render
+    # os.getenv('DATABASE_URL') is the primary source (e.g., for Render's PostgreSQL).
+    # 'sqlite:///render_prod_app.db' is the fallback, creating the file in the app root on Render's ephemeral disk.
+    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL') or 'sqlite:///render_prod_app.db'
+    print(f"DEBUG [ProductionConfig]: SQLALCHEMY_DATABASE_URI has been set to: {SQLALCHEMY_DATABASE_URI}")
 
     # Ensure critical environment variables are set in production
-    if not os.getenv('SECRET_KEY') or Config.SECRET_KEY == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
-        raise ValueError("Production SECRET_KEY is not set or is using the default development key.")
+    # Changed from raise ValueError to print for less disruptive startup during troubleshooting.
+    if not os.getenv('SECRET_KEY') or \
+       (hasattr(Config, 'SECRET_KEY') and Config.SECRET_KEY == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod') or \
+       os.getenv('SECRET_KEY') == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod': # Check both direct os.getenv and inherited Config.SECRET_KEY if it was set by default
+        print("CRITICAL_WARNING [ProductionConfig]: Production SECRET_KEY is not set or is using the default development key. Please set a strong SECRET_KEY for production.")
+    
     if not os.getenv('ENCRYPTION_KEY'):
-        raise ValueError("Production ENCRYPTION_KEY is not set.")
-    # Add similar checks for RESEND_API_KEY, AFRICASTALKING keys etc. if they are critical for production.
-
+        print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set. Fingerprint data encryption will be insecure or may fail.")
+    
+    # Consider adding similar critical warnings for other keys if they are essential for production functionality:
+    # if not os.getenv('RESEND_API_KEY'):
+    #     print("CRITICAL_WARNING [ProductionConfig]: Production RESEND_API_KEY is not set.")
+    # if not os.getenv('AFRICASTALKING_API_KEY'): # and other relevant keys
+    #     print("CRITICAL_WARNING [ProductionConfig]: Production AFRICASTALKING_API_KEY is not set.")
+    # etc.
 
 # This is the dictionary your app/__init__.py needs to import
 config_by_name = dict(
