@@ -7,25 +7,26 @@ app_dir = os.path.dirname(current_script_path)
 backend_root_dir = os.path.dirname(app_dir) # This is your 'backend' folder
 dotenv_path = os.path.join(backend_root_dir, '.env')
 
-# Load .env only if it exists (it won't exist in production on Render typically)
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
-    # print(f"DEBUG [config.py]: Successfully loaded .env file from: {dotenv_path}") # Less verbose for prod
+    # Conditional print for development
+    if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
+        print(f"DEBUG [config.py]: Successfully loaded .env file from: {dotenv_path}")
 else:
-    print(f"INFO [config.py]: .env file NOT FOUND at: {dotenv_path}. Relying on environment variables set by the platform.")
+    # This is expected on Render, as .env is not deployed
+    if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1': # Or check if not 'production'
+        print(f"INFO [config.py]: .env file NOT FOUND at: {dotenv_path}. Relying on environment variables set by the platform or defaults.")
 
-# These are primarily for local dev or if config builds URI from parts
 DB_URL_FROM_ENV = os.getenv('DB_URL')
-DB_HOST_FROM_ENV = os.getenv('DB_HOST')
+DB_HOST_FROM_ENV = os.getenv('DB_HOST') # Used to determine if PostgreSQL specific vars are set
 
-# Print these only if FLASK_ENV is development or FLASK_DEBUG is true
 if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
     print(f"DEBUG [config.py]: Value of os.getenv('DB_URL') after load_dotenv() is: {DB_URL_FROM_ENV}")
     print(f"DEBUG [config.py]: Value of os.getenv('DB_HOST') is: {DB_HOST_FROM_ENV}")
 
 class Config:
     """Base configuration class."""
-    SECRET_KEY = os.getenv('SECRET_KEY') # Production should FAIL if not set, see ProductionConfig
+    SECRET_KEY = os.getenv('SECRET_KEY', 'a-very-secure-default-dev-secret-key-please-change-me-for-prod')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY')
     RESEND_API_KEY = os.getenv('RESEND_API_KEY')
@@ -37,35 +38,37 @@ class Config:
     FIREBASE_PROJECT_ID = os.getenv('FIREBASE_PROJECT_ID')
 
     # Default SQLALCHEMY_DATABASE_URI (will be overridden by specific configs)
-    # This ensures the attribute exists on the base Config class.
     SQLALCHEMY_DATABASE_URI = 'sqlite:///' + os.path.join(backend_root_dir, 'default_app_sqlite.db')
-
 
     @staticmethod
     def init_app(app):
-        # Check for critical missing configurations, especially for production
-        if app.config.get('ENV') == 'production': # or app.config.get('DEBUG') is False
-            if not app.config.get('SECRET_KEY') or app.config['SECRET_KEY'] == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
-                app.logger.critical("CRITICAL: Production SECRET_KEY is not set or is using a weak default!")
-            if not app.config.get('ENCRYPTION_KEY'):
-                app.logger.critical("CRITICAL: Production ENCRYPTION_KEY is not set!")
-            # For the new setup, DATABASE_URL check from Render is not primary for SQLite
-            # if not app.config.get('DATABASE_URL') and not ('sqlite:///' in app.config.get('SQLALCHEMY_DATABASE_URI', '')):
-            # app.logger.critical("CRITICAL: Production DATABASE_URL for PostgreSQL is not set!")
-            if 'sqlite:///render_prod_database.db' not in app.config.get('SQLALCHEMY_DATABASE_URI', ''): # Updated to check the new fixed path
-                # This condition might need adjustment based on how you verify the forced SQLite path
-                app.logger.info(f"INFO: Production is set to use specific SQLite path: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
-            # Add more critical checks for other API keys if needed for production
+        is_production = app.config.get('ENV') == 'production' or not app.config.get('DEBUG', False)
         
-        # Log the database URI being used, especially in development
-        if app.debug:
-            app.logger.info(f"INFO: Flask App Initialized. Using SQLALCHEMY_DATABASE_URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
+        if not app.config.get('SECRET_KEY') or \
+           app.config['SECRET_KEY'] == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
+            log_message = "CRITICAL: Production SECRET_KEY is not set or is using a weak default!" if is_production else \
+                          "WARNING: SECRET_KEY is not set or is using a weak default. Please set a strong SECRET_KEY for production."
+            if hasattr(app, 'logger'): app.logger.warning(log_message)
+            else: print(log_message)
+        
+        if not app.config.get('ENCRYPTION_KEY'):
+            log_message = "CRITICAL: Production ENCRYPTION_KEY is not set!" if is_production else \
+                          "WARNING: ENCRYPTION_KEY not set. Fingerprint data encryption will be insecure or may fail."
+            if hasattr(app, 'logger'): app.logger.warning(log_message)
+            else: print(log_message)
+        
+        if app.debug or is_production: # Always log DB URI in production for clarity during setup
+            if hasattr(app, 'logger'):
+                app.logger.info(f"INFO: Flask App Initialized. Using SQLALCHEMY_DATABASE_URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
+            else:
+                print(f"INFO: Flask App Initialized. Using SQLALCHEMY_DATABASE_URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
 
 
 class DevelopmentConfig(Config):
     DEBUG = True
+    # Use DB_URL from .env for local dev, defaulting to dev_app.db in backend root
     SQLALCHEMY_DATABASE_URI = os.getenv('DB_URL') or \
-                              'sqlite:///' + os.path.join(backend_root_dir, 'dev_app.db') # Specific for dev
+                              'sqlite:///' + os.path.join(backend_root_dir, 'dev_app.db')
     # SQLALCHEMY_ECHO = True 
 
 class TestingConfig(Config):
@@ -76,22 +79,26 @@ class TestingConfig(Config):
     SECRET_KEY = os.getenv('TEST_SECRET_KEY', 'test-secret-key')
     ENCRYPTION_KEY = os.getenv('TEST_ENCRYPTION_KEY', Config.ENCRYPTION_KEY or 'test_default_encryption_key_32b_placeholder')
 
-# --- Updated ProductionConfig (Option A) ---
 class ProductionConfig(Config):
     DEBUG = False
-    # Use a consistent SQLite path for production testing on ephemeral disk
-    # This file will be in the root of your app directory on Render.
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///render_prod_database.db' 
+    # For SQLite testing on Render's ephemeral disk:
+    # This file will be created in the root of your app directory on Render
+    # (relative to where Gunicorn/Flask is run, typically /opt/render/project/src/ on Render).
+    # The 'instance' folder might be more standard if your app factory configures an instance_path.
+    # For simplicity and directness for ephemeral SQLite on Render:
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///render_prod_app.db' 
+    
+    # This print will execute when config.py is imported, useful for build logs on Render
+    print(f"INFO [ProductionConfig]: Using fixed SQLite URI for production/Render: {SQLALCHEMY_DATABASE_URI}")
 
-    print(f"INFO [ProductionConfig]: Using fixed SQLite URI for production: {SQLALCHEMY_DATABASE_URI}")
-
-    # Ensure critical environment variables are set (SECRET_KEY, ENCRYPTION_KEY etc.)
+    # Ensure critical environment variables are set for production
+    # These checks run when ProductionConfig class is defined.
     if not os.getenv('SECRET_KEY') or os.getenv('SECRET_KEY') == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
         print("CRITICAL_WARNING [ProductionConfig]: Production SECRET_KEY is not set or is using the default development key!")
     if not os.getenv('ENCRYPTION_KEY'):
         print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set!")
-    # ... (your checks for other env vars) ...
-# --- End of Updated ProductionConfig ---
+    # Add more checks for other critical os.getenv values here if needed for production
+
 
 config_by_name = dict(
     dev=DevelopmentConfig,
@@ -103,7 +110,6 @@ config_by_name = dict(
 # --- Fernet Cipher Initialization ---
 _fernet_cipher = None
 _env_encryption_key = os.getenv('ENCRYPTION_KEY')
-# For TestingConfig, if FLASK_CONFIG=test, it might override ENCRYPTION_KEY from .env if TEST_ENCRYPTION_KEY is set
 if os.getenv('FLASK_CONFIG') == 'test' and os.getenv('TEST_ENCRYPTION_KEY'):
     _env_encryption_key = os.getenv('TEST_ENCRYPTION_KEY')
 
@@ -111,7 +117,8 @@ if _env_encryption_key:
     try:
         from cryptography.fernet import Fernet
         _fernet_cipher = Fernet(_env_encryption_key.encode())
-        if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1': # Only print in dev
+        # Conditional print for development
+        if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
             print("DEBUG [config.py]: Fernet cipher initialized successfully.")
     except ImportError:
         print("WARNING [config.py]: 'cryptography' library not installed. Fingerprint data encryption will not work.")
