@@ -80,27 +80,8 @@ class TestingConfig(Config):
 # --- Updated ProductionConfig ---
 class ProductionConfig(Config):
     DEBUG = False
-    # Production ALWAYS uses DATABASE_URL from the environment (set by Render)
-    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL')
-
-    # Add a check to ensure DATABASE_URL is actually set in production
-    if not SQLALCHEMY_DATABASE_URI:
-        # This should be a critical failure in a real production setup
-        print("CRITICAL_ERROR [ProductionConfig]: DATABASE_URL environment variable is NOT SET for production!")
-        # To avoid the app crashing immediately during import but make it clear it's broken:
-        SQLALCHEMY_DATABASE_URI = 'sqlite:///DATABASE_URL_NOT_SET_ERROR.db' 
-    else:
-        # If it's a Render PostgreSQL URL, it might start with postgres://
-        # SQLAlchemy with psycopg2 prefers postgresql+psycopg2:// or just postgresql://
-        if SQLALCHEMY_DATABASE_URI.startswith('postgres://'):
-            SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace('postgres://', 'postgresql+psycopg2://', 1)
-        elif SQLALCHEMY_DATABASE_URI.startswith('postgresql://') and \
-             not SQLALCHEMY_DATABASE_URI.startswith('postgresql+psycopg2://') and \
-             not SQLALCHEMY_DATABASE_URI.startswith('sqlite://'): # Ensure it's not already a valid SQLite URI
-             # Ensure the driver is specified if only postgresql:// is given for a non-SQLite URL
-            SQLALCHEMY_DATABASE_URI = 'postgresql+psycopg2://' + SQLALCHEMY_DATABASE_URI.split('://',1)[-1]
-
-    print(f"INFO [ProductionConfig]: Using SQLALCHEMY_DATABASE_URI: {SQLALCHEMY_DATABASE_URI}")
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///render_prod_app.db' # Consistent name
+    print(f"INFO [ProductionConfig]: Using fixed SQLite URI for production/Render: {SQLALCHEMY_DATABASE_URI}")
 
     # Ensure other critical environment variables are set for production
     # These checks run when ProductionConfig class is defined.
