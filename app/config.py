@@ -81,17 +81,19 @@ class TestingConfig(Config):
 # In backend/app/config.py
 class ProductionConfig(Config):
     DEBUG = False
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///render_application.db' # Or your chosen consistent name like 'checkpointx_prod.db'
-    print(f"INFO [ProductionConfig]: Using fixed SQLite URI for production/Render: {SQLALCHEMY_DATABASE_URI}")
-    # ... rest of ProductionConfig ...
-    
-    # ... (your checks for SECRET_KEY, ENCRYPTION_KEY etc. should still use os.getenv)
+    # This file will be created in the root of your app directory on Render's ephemeral disk
+    # Ensure this is a consistent name.
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///checkpointx_prod.db' # Or your preferred consistent name
+
+    # This print statement is crucial for debugging during build AND runtime on Render
+    print(f"INFO [ProductionConfig]: Using SQLite database URI: {SQLALCHEMY_DATABASE_URI}")
+
+    # Ensure critical environment variables are set for production
     if not os.getenv('SECRET_KEY') or Config.SECRET_KEY == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
         print("CRITICAL_WARNING [ProductionConfig]: Production SECRET_KEY is not set or is using the default development key!")
     if not os.getenv('ENCRYPTION_KEY'):
-        print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set!")   
-         # Add checks for other critical API keys if they are essential for app startup
-         # --- End of Updated ProductionConfig ---
+        print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set!")
+    # ... other critical checks ...
 
 config_by_name = dict(
     dev=DevelopmentConfig,
