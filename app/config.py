@@ -72,39 +72,39 @@ class TestingConfig(Config):
     SECRET_KEY = os.getenv('TEST_SECRET_KEY', 'test-secret-key')
     ENCRYPTION_KEY = os.getenv('TEST_ENCRYPTION_KEY', Config.ENCRYPTION_KEY or 'test_default_encryption_key_32b_placeholder')
 
-
+# --- Updated ProductionConfig ---
 class ProductionConfig(Config):
     DEBUG = False
-    # Production ALWAYS uses DATABASE_URL from the environment (set by Render for its PostgreSQL)
-    # The 'postgresql+psycopg2://' scheme is often implicitly handled by SQLAlchemy
-    # when it sees a standard PostgreSQL URL, but being explicit is safer.
+    # ALWAYS prioritize DATABASE_URL from Render's environment variables for production
     SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL')
-    
-    if SQLALCHEMY_DATABASE_URI and SQLALCHEMY_DATABASE_URI.startswith('postgres://'):
-        # Heroku/Render often provides 'postgres://' which SQLAlchemy might not like with psycopg2 directly
-        # Convert to 'postgresql+psycopg2://'
-        SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace('postgres://', 'postgresql+psycopg2://', 1)
-    elif SQLALCHEMY_DATABASE_URI and not SQLALCHEMY_DATABASE_URI.startswith('postgresql+psycopg2://') and not SQLALCHEMY_DATABASE_URI.startswith('sqlite:///'):
-        # If it's a PostgreSQL URL but doesn't have the driver prefix
-        SQLALCHEMY_DATABASE_URI = 'postgresql+psycopg2://' + SQLALCHEMY_DATABASE_URI.split('://', 1)[-1]
 
-
-    # If DATABASE_URL is not set on Render, it's a critical misconfiguration for production.
-    # The application should ideally not start or fall back to a clearly non-functional state.
+    # If DATABASE_URL is NOT set by Render (e.g., you haven't configured a PostgreSQL instance on Render yet
+    # and want to test with SQLite on Render's ephemeral disk), then define a specific path.
+    # This path should be consistent between the migration step and the running app.
     if not SQLALCHEMY_DATABASE_URI:
-        print("CRITICAL ERROR [ProductionConfig]: DATABASE_URL environment variable is not set for production!")
-        # Forcing a fallback to a clearly named error DB for Render's ephemeral disk,
-        # this makes it obvious if migrations run against a wrong DB.
-        # However, the app should ideally fail to start if DATABASE_URL is missing in prod.
-        # For safety during this setup phase, let's define it, but it will cause "no such table"
-        # if migrations don't run against this specific file due to DATABASE_URL missing.
-        SQLALCHEMY_DATABASE_URI = f"sqlite:///{os.path.join(os.getenv('RENDER_INSTANCE_DIR', backend_root_dir), 'instance', 'RENDER_DB_URL_MISSING.db')}"
-        print(f"DEBUG [ProductionConfig]: Falling back to placeholder DB due to missing DATABASE_URL: {SQLALCHEMY_DATABASE_URI}")
+        # Create the SQLite DB in a writable location, e.g., /var/data/ or relative to app root's instance folder
+        # Using '/var/data/' is often available on Render for persistent storage (if you add a disk)
+        # For ephemeral storage, a relative path is simpler to start.
+        # Let's use 'instance/prod_app.db' and ensure 'instance' dir is created.
+        instance_folder_path = os.path.join(backend_root_dir, 'instance') # backend_root_dir is defined at the top of config.py
+        SQLALCHEMY_DATABASE_URI = f"sqlite:///{os.path.join(instance_folder_path, 'prod_checkpointx.db')}"
+        print(f"WARNING [ProductionConfig]: DATABASE_URL not set. Falling back to SQLite at: {SQLALCHEMY_DATABASE_URI}")
     else:
-        print(f"INFO [ProductionConfig]: Using SQLALCHEMY_DATABASE_URI: {SQLALCHEMY_DATABASE_URI}")
+        # If DATABASE_URL is PostgreSQL (common from Render), ensure correct scheme for SQLAlchemy
+        if SQLALCHEMY_DATABASE_URI.startswith('postgres://'):
+            SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace('postgres://', 'postgresql+psycopg2://', 1)
+        elif SQLALCHEMY_DATABASE_URI.startswith('postgresql://') and not SQLALCHEMY_DATABASE_URI.startswith('postgresql+psycopg2://'):
+            SQLALCHEMY_DATABASE_URI = 'postgresql+psycopg2://' + SQLALCHEMY_DATABASE_URI.split('://',1)[-1]
 
-    # Add further checks within init_app for production if SECRET_KEY, ENCRYPTION_KEY are not found
+    print(f"INFO [ProductionConfig]: Final SQLALCHEMY_DATABASE_URI for production: {SQLALCHEMY_DATABASE_URI}")
 
+    # Ensure critical environment variables are set
+    if not Config.SECRET_KEY or Config.SECRET_KEY == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
+        # This should ideally raise an error in production
+        print("CRITICAL_WARNING [ProductionConfig]: Production SECRET_KEY is not set or is using a weak default.")
+    if not Config.ENCRYPTION_KEY:
+        print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set.")
+# --- End of Updated ProductionConfig ---
 
 config_by_name = dict(
     dev=DevelopmentConfig,
