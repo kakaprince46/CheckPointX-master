@@ -7,18 +7,17 @@ app_dir = os.path.dirname(current_script_path)
 backend_root_dir = os.path.dirname(app_dir) # This is your 'backend' folder
 dotenv_path = os.path.join(backend_root_dir, '.env')
 
+# Load .env only if it exists (it won't exist in production on Render typically)
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
-    # Conditional print for development
     if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
         print(f"DEBUG [config.py]: Successfully loaded .env file from: {dotenv_path}")
 else:
-    # This is expected on Render, as .env is not deployed
-    if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1': # Or check if not 'production'
+    if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
         print(f"INFO [config.py]: .env file NOT FOUND at: {dotenv_path}. Relying on environment variables set by the platform or defaults.")
 
 DB_URL_FROM_ENV = os.getenv('DB_URL')
-DB_HOST_FROM_ENV = os.getenv('DB_HOST') # Used to determine if PostgreSQL specific vars are set
+DB_HOST_FROM_ENV = os.getenv('DB_HOST')
 
 if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
     print(f"DEBUG [config.py]: Value of os.getenv('DB_URL') after load_dotenv() is: {DB_URL_FROM_ENV}")
@@ -57,16 +56,15 @@ class Config:
             if hasattr(app, 'logger'): app.logger.warning(log_message)
             else: print(log_message)
         
-        if app.debug or is_production: # Always log DB URI in production for clarity during setup
-            if hasattr(app, 'logger'):
-                app.logger.info(f"INFO: Flask App Initialized. Using SQLALCHEMY_DATABASE_URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
-            else:
-                print(f"INFO: Flask App Initialized. Using SQLALCHEMY_DATABASE_URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
+        # Log the final DB URI being used by the app
+        if hasattr(app, 'logger'):
+            app.logger.info(f"INFO: Flask App Initialized. Using SQLALCHEMY_DATABASE_URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
+        else:
+            print(f"INFO: Flask App Initialized. Using SQLALCHEMY_DATABASE_URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
 
 
 class DevelopmentConfig(Config):
     DEBUG = True
-    # Use DB_URL from .env for local dev, defaulting to dev_app.db in backend root
     SQLALCHEMY_DATABASE_URI = os.getenv('DB_URL') or \
                               'sqlite:///' + os.path.join(backend_root_dir, 'dev_app.db')
     # SQLALCHEMY_ECHO = True 
@@ -79,26 +77,39 @@ class TestingConfig(Config):
     SECRET_KEY = os.getenv('TEST_SECRET_KEY', 'test-secret-key')
     ENCRYPTION_KEY = os.getenv('TEST_ENCRYPTION_KEY', Config.ENCRYPTION_KEY or 'test_default_encryption_key_32b_placeholder')
 
+# --- Updated ProductionConfig ---
 class ProductionConfig(Config):
     DEBUG = False
-    # For SQLite testing on Render's ephemeral disk:
-    # This file will be created in the root of your app directory on Render
-    # (relative to where Gunicorn/Flask is run, typically /opt/render/project/src/ on Render).
-    # The 'instance' folder might be more standard if your app factory configures an instance_path.
-    # For simplicity and directness for ephemeral SQLite on Render:
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///render_prod_app.db' 
-    
-    # This print will execute when config.py is imported, useful for build logs on Render
-    print(f"INFO [ProductionConfig]: Using fixed SQLite URI for production/Render: {SQLALCHEMY_DATABASE_URI}")
+    # Production ALWAYS uses DATABASE_URL from the environment (set by Render)
+    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL')
 
-    # Ensure critical environment variables are set for production
+    # Add a check to ensure DATABASE_URL is actually set in production
+    if not SQLALCHEMY_DATABASE_URI:
+        # This should be a critical failure in a real production setup
+        print("CRITICAL_ERROR [ProductionConfig]: DATABASE_URL environment variable is NOT SET for production!")
+        # To avoid the app crashing immediately during import but make it clear it's broken:
+        SQLALCHEMY_DATABASE_URI = 'sqlite:///DATABASE_URL_NOT_SET_ERROR.db' 
+    else:
+        # If it's a Render PostgreSQL URL, it might start with postgres://
+        # SQLAlchemy with psycopg2 prefers postgresql+psycopg2:// or just postgresql://
+        if SQLALCHEMY_DATABASE_URI.startswith('postgres://'):
+            SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace('postgres://', 'postgresql+psycopg2://', 1)
+        elif SQLALCHEMY_DATABASE_URI.startswith('postgresql://') and \
+             not SQLALCHEMY_DATABASE_URI.startswith('postgresql+psycopg2://') and \
+             not SQLALCHEMY_DATABASE_URI.startswith('sqlite://'): # Ensure it's not already a valid SQLite URI
+             # Ensure the driver is specified if only postgresql:// is given for a non-SQLite URL
+            SQLALCHEMY_DATABASE_URI = 'postgresql+psycopg2://' + SQLALCHEMY_DATABASE_URI.split('://',1)[-1]
+
+    print(f"INFO [ProductionConfig]: Using SQLALCHEMY_DATABASE_URI: {SQLALCHEMY_DATABASE_URI}")
+
+    # Ensure other critical environment variables are set for production
     # These checks run when ProductionConfig class is defined.
     if not os.getenv('SECRET_KEY') or os.getenv('SECRET_KEY') == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
         print("CRITICAL_WARNING [ProductionConfig]: Production SECRET_KEY is not set or is using the default development key!")
     if not os.getenv('ENCRYPTION_KEY'):
         print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set!")
     # Add more checks for other critical os.getenv values here if needed for production
-
+# --- End of Updated ProductionConfig ---
 
 config_by_name = dict(
     dev=DevelopmentConfig,
@@ -109,7 +120,8 @@ config_by_name = dict(
 
 # --- Fernet Cipher Initialization ---
 _fernet_cipher = None
-_env_encryption_key = os.getenv('ENCRYPTION_KEY')
+_env_encryption_key = os.getenv('ENCRYPTION_KEY') # Get key from env
+# For TestingConfig, if FLASK_CONFIG=test and TEST_ENCRYPTION_KEY is set, use that
 if os.getenv('FLASK_CONFIG') == 'test' and os.getenv('TEST_ENCRYPTION_KEY'):
     _env_encryption_key = os.getenv('TEST_ENCRYPTION_KEY')
 
@@ -117,7 +129,6 @@ if _env_encryption_key:
     try:
         from cryptography.fernet import Fernet
         _fernet_cipher = Fernet(_env_encryption_key.encode())
-        # Conditional print for development
         if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
             print("DEBUG [config.py]: Fernet cipher initialized successfully.")
     except ImportError:
@@ -127,6 +138,7 @@ if _env_encryption_key:
         print(f"WARNING [config.py]: Invalid ENCRYPTION_KEY format or other Fernet error. Could not initialize Fernet cipher. Error: {e}")
         _fernet_cipher = None 
 else:
+    # Only print debug if in dev/debug mode and key is missing
     if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
         print("DEBUG [config.py]: ENCRYPTION_KEY not found in environment, Fernet cipher not initialized.")
 
