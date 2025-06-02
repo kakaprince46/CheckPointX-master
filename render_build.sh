@@ -2,23 +2,24 @@
 # Exit on any error
 set -o errexit
 
-# Upgrade pip
-pip install --upgrade pip
+echo "INFO [render_build.sh]: Starting build process..."
 
-# Install dependencies
+echo "INFO [render_build.sh]: Upgrading pip..."
+python -m pip install --upgrade pip # More explicit way to call pip from current python
+
+echo "INFO [render_build.sh]: Installing dependencies from requirements.txt..."
 pip install -r requirements.txt
 
-# Set FLASK_APP and FLASK_ENV for the migration command
-# Render will use FLASK_CONFIG for the running app if you set it in env vars
+# Set FLASK_APP and FLASK_CONFIG for the migration command
+# These will be used by Flask CLI to load the correct app instance and configuration.
 export FLASK_APP="app:create_app" 
-# For migrations, it's often fine to run them with a 'production' like config,
-# but ensure your ProductionConfig in config.py correctly loads DATABASE_URL
-# from Render's environment variables.
-export FLASK_ENV="production" # Or use FLASK_CONFIG=prod if your config.py uses that
+export FLASK_CONFIG="prod" # Ensure ProductionConfig is used for migrations
 
-echo "INFO: Running database migrations..."
+echo "INFO [render_build.sh]: FLASK_APP set to ${FLASK_APP}"
+echo "INFO [render_build.sh]: FLASK_CONFIG set to ${FLASK_CONFIG}"
+echo "INFO [render_build.sh]: About to run database migrations (flask db upgrade)..."
+
 flask db upgrade
-echo "INFO: Database migrations complete."
 
-# Note: Gunicorn (your web server) will be started by Render's "Start Command"
-# This script is only for the build phase.
+echo "INFO [render_build.sh]: Database migrations complete."
+echo "INFO [render_build.sh]: Build process finished."
