@@ -49,8 +49,12 @@ class Config:
                 app.logger.critical("CRITICAL: Production SECRET_KEY is not set or is using a weak default!")
             if not app.config.get('ENCRYPTION_KEY'):
                 app.logger.critical("CRITICAL: Production ENCRYPTION_KEY is not set!")
-            if not app.config.get('DATABASE_URL') and not ('sqlite:///' in app.config.get('SQLALCHEMY_DATABASE_URI', '')): # If DATABASE_URL from Render isn't used for URI
-                app.logger.critical("CRITICAL: Production DATABASE_URL for PostgreSQL is not set!")
+            # For the new setup, DATABASE_URL check from Render is not primary for SQLite
+            # if not app.config.get('DATABASE_URL') and not ('sqlite:///' in app.config.get('SQLALCHEMY_DATABASE_URI', '')):
+            # app.logger.critical("CRITICAL: Production DATABASE_URL for PostgreSQL is not set!")
+            if 'sqlite:///render_app.db' not in app.config.get('SQLALCHEMY_DATABASE_URI', ''):
+                 # This condition might need adjustment based on how you verify the forced SQLite path
+                 app.logger.info(f"INFO: Production is set to use specific SQLite path: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
             # Add more critical checks for other API keys if needed for production
         
         # Log the database URI being used, especially in development
@@ -75,35 +79,27 @@ class TestingConfig(Config):
 # --- Updated ProductionConfig ---
 class ProductionConfig(Config):
     DEBUG = False
-    # ALWAYS prioritize DATABASE_URL from Render's environment variables for production
-    SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL')
-
-    # If DATABASE_URL is NOT set by Render (e.g., you haven't configured a PostgreSQL instance on Render yet
-    # and want to test with SQLite on Render's ephemeral disk), then define a specific path.
-    # This path should be consistent between the migration step and the running app.
-    if not SQLALCHEMY_DATABASE_URI:
-        # Create the SQLite DB in a writable location, e.g., /var/data/ or relative to app root's instance folder
-        # Using '/var/data/' is often available on Render for persistent storage (if you add a disk)
-        # For ephemeral storage, a relative path is simpler to start.
-        # Let's use 'instance/prod_app.db' and ensure 'instance' dir is created.
-        instance_folder_path = os.path.join(backend_root_dir, 'instance') # backend_root_dir is defined at the top of config.py
-        SQLALCHEMY_DATABASE_URI = f"sqlite:///{os.path.join(instance_folder_path, 'prod_checkpointx.db')}"
-        print(f"WARNING [ProductionConfig]: DATABASE_URL not set. Falling back to SQLite at: {SQLALCHEMY_DATABASE_URI}")
-    else:
-        # If DATABASE_URL is PostgreSQL (common from Render), ensure correct scheme for SQLAlchemy
-        if SQLALCHEMY_DATABASE_URI.startswith('postgres://'):
-            SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace('postgres://', 'postgresql+psycopg2://', 1)
-        elif SQLALCHEMY_DATABASE_URI.startswith('postgresql://') and not SQLALCHEMY_DATABASE_URI.startswith('postgresql+psycopg2://'):
-            SQLALCHEMY_DATABASE_URI = 'postgresql+psycopg2://' + SQLALCHEMY_DATABASE_URI.split('://',1)[-1]
-
-    print(f"INFO [ProductionConfig]: Final SQLALCHEMY_DATABASE_URI for production: {SQLALCHEMY_DATABASE_URI}")
+    
+    # For this SQLite test on Render, we will use a fixed relative path.
+    # This ensures flask db upgrade and the running app use the SAME file.
+    # The file will be in the root of your backend project on Render.
+    # The original backend_root_dir points to the 'backend' folder.
+    # So, 'sqlite:///render_app.db' would be relative to where the script is run from.
+    # If Render runs from 'backend' folder, then 'render_app.db' will be in 'backend/render_app.db'
+    # If Render runs from project root (containing 'backend'), then 'sqlite:///backend/render_app.db' might be needed
+    # For simplicity and assuming Render runs from within the 'backend' directory or similar:
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///render_app.db' 
+                                    # Changed name for clarity and to ensure it's fresh
+    
+    print(f"INFO [ProductionConfig]: Using SQLite database URI: {SQLALCHEMY_DATABASE_URI}")
 
     # Ensure critical environment variables are set
-    if not Config.SECRET_KEY or Config.SECRET_KEY == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
-        # This should ideally raise an error in production
-        print("CRITICAL_WARNING [ProductionConfig]: Production SECRET_KEY is not set or is using a weak default.")
-    if not Config.ENCRYPTION_KEY:
-        print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set.")
+    # Using os.getenv() directly here as per the update request
+    if not os.getenv('SECRET_KEY') or os.getenv('SECRET_KEY') == 'a-very-secure-default-dev-secret-key-please-change-me-for-prod':
+        print("CRITICAL_WARNING [ProductionConfig]: Production SECRET_KEY is not set or is using the default development key!")
+    if not os.getenv('ENCRYPTION_KEY'):
+        print("CRITICAL_WARNING [ProductionConfig]: Production ENCRYPTION_KEY is not set!")
+    # Add other critical checks if needed
 # --- End of Updated ProductionConfig ---
 
 config_by_name = dict(
