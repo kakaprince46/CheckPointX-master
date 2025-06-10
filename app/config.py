@@ -67,20 +67,6 @@ class Config:
         else:
             print(f"INFO: Flask App Initialized. Using SQLALCHEMY_DATABASE_URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
 
-class DevelopmentConfig(Config):
-    DEBUG = True
-    SQLALCHEMY_DATABASE_URI = os.getenv('DB_URL') or \
-                              'sqlite:///' + os.path.join(backend_root_dir, 'dev_app.db')
-    # SQLALCHEMY_ECHO = True
-
-class TestingConfig(Config):
-    TESTING = True
-    SQLALCHEMY_DATABASE_URI = os.getenv('TEST_DB_URL') or \
-                              'sqlite:///' + os.path.join(backend_root_dir, 'test_app.db')
-    WTF_CSRF_ENABLED = False
-    SECRET_KEY = os.getenv('TEST_SECRET_KEY', 'test-secret-key')
-    ENCRYPTION_KEY = os.getenv('TEST_ENCRYPTION_KEY', Config.ENCRYPTION_KEY or 'test_default_encryption_key_32b_placeholder')
-
 # --- Updated ProductionConfig ---
 class ProductionConfig(Config):
     DEBUG = False
