@@ -1,5 +1,6 @@
 import os
 from dotenv import load_dotenv
+from cryptography.fernet import Fernet
 
 # --- Path Setup for .env (primarily for local development) ---
 current_script_path = os.path.abspath(__file__)
@@ -83,17 +84,29 @@ class TestingConfig(Config):
 # --- Updated ProductionConfig ---
 class ProductionConfig(Config):
     DEBUG = False
+    
+    # Production ALWAYS uses the DATABASE_URL from the environment (set by Render)
     SQLALCHEMY_DATABASE_URI = os.getenv('DATABASE_URL')
 
-    # Ensure psycopg2 compatibility
-    if SQLALCHEMY_DATABASE_URI and SQLALCHEMY_DATABASE_URI.startswith('postgres://'):
-        SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace('postgres://', 'postgresql+psycopg2://', 1)
-
-    # Ensure DATABASE_URL is set
+    # This is a critical check. If DATABASE_URL is not set on Render, the app should fail immediately.
     if not SQLALCHEMY_DATABASE_URI:
-        raise ValueError("CRITICAL_ERROR: DATABASE_URL environment variable is NOT SET for production!")
+        raise ValueError("CRITICAL_ERROR: No DATABASE_URL set for production environment!")
+    
+    # Render's default PostgreSQL URL starts with 'postgres://'.
+    # SQLAlchemy and psycopg2 work better with 'postgresql://' or 'postgresql+psycopg2://'
+    # This code replaces it to ensure compatibility.
+    if SQLALCHEMY_DATABASE_URI.startswith('postgres://'):
+        SQLALCHEMY_DATABASE_URI = SQLALCHEMY_DATABASE_URI.replace('postgres://', 'postgresql://', 1)
+    
+    # This print statement is crucial for debugging your Render deployment.
+    # It will show in the logs which database your app is trying to connect to.
+    print(f"INFO [ProductionConfig]: Using production database URI: {SQLALCHEMY_DATABASE_URI}")
 
-    print(f"INFO [ProductionConfig]: Using production database.")
+    # Ensure other critical environment variables are set
+    if not os.getenv('SECRET_KEY'):
+        raise ValueError("CRITICAL_ERROR: Production SECRET_KEY is not set!")
+    if not os.getenv('ENCRYPTION_KEY'):
+        raise ValueError("CRITICAL_WARNING: Production ENCRYPTION_KEY is not set!")
 
 config_by_name = dict(
     dev=DevelopmentConfig,
@@ -111,7 +124,6 @@ if os.getenv('FLASK_CONFIG') == 'test' and os.getenv('TEST_ENCRYPTION_KEY'):
 
 if _env_encryption_key:
     try:
-        from cryptography.fernet import Fernet
         _fernet_cipher = Fernet(_env_encryption_key.encode())
         if os.getenv('FLASK_ENV') == 'development' or os.getenv('FLASK_DEBUG') == '1':
             print("DEBUG [config.py]: Fernet cipher initialized successfully.")

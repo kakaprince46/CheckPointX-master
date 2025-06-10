@@ -17,8 +17,10 @@ export FLASK_CONFIG="prod"
 echo "INFO [render_build.sh]: FLASK_APP is ${FLASK_APP}"
 echo "INFO [render_build.sh]: FLASK_CONFIG is ${FLASK_CONFIG}"
 
-# Run database migrations
+# This command applies migrations to the database specified in ProductionConfig
+# which is pulled from the DATABASE_URL environment variable
 echo "INFO [render_build.sh]: Running database migrations (flask db upgrade)..."
 flask db upgrade
+
 echo "INFO [render_build.sh]: Database migrations complete."
 echo "INFO [render_build.sh]: Build process finished."
