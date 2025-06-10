@@ -1,8 +1,8 @@
-"""Create initial database schema from models for SQLite
+"""Initial schema for local SQLite dev
 
-Revision ID: 96ced39a55ce
+Revision ID: 08c4def914b7
 Revises: 
-Create Date: 2025-05-31 05:39:22.272055
+Create Date: 2025-06-09 06:47:14.041260
 
 """
 from alembic import op
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '96ced39a55ce'
+revision = '08c4def914b7'
 down_revision = None
 branch_labels = None
 depends_on = None
